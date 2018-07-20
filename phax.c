@@ -119,12 +119,14 @@ get_vm_maps(pid_t pid)
     }
 
 cleanup:
-    fclose(fp);
+    if (fp != NULL) fclose(fp);
     return head;
 
 cleanup_err:
-    free_vm_maps(head);
-    head = NULL;
+    if (head != NULL) {
+        free_vm_maps(head);
+        head = NULL;
+    }
     goto cleanup;
 }
 
