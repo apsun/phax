@@ -21,12 +21,13 @@ main(void)
         if (strncmp(buf, "read", strlen("read")) == 0) {
             printf("%jd\n", (intmax_t)*value);
         } else if (strncmp(buf, "write ", strlen("write ")) == 0) {
-            *value = strtoll(&buf[strlen("write ")], NULL, 0);
+            T val = strtoll(&buf[strlen("write ")], NULL, 0);
             for (int i = 0; i < BUF_SIZE / 20; ++i) {
                 int off = rand() % sizeof(T);
                 char *p = (char *)&mem[rand() % (BUF_SIZE - 1)];
-                *(T *)(p + off) = *value;
+                *(T *)(p + off) = val;
             }
+            *value = val;
         }
     }
 }
