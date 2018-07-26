@@ -10,7 +10,7 @@ fi
 gcc -Wall -Wextra -pedantic -std=c11 phax.c -o ./phax
 
 if [ $(cat /proc/sys/kernel/yama/ptrace_scope) -ne 0 ]; then
-    sudo tee /proc/sys/kernel/yama/ptrace_scope <<< 0
+    sudo tee /proc/sys/kernel/yama/ptrace_scope <<< 0 >/dev/null
 fi
 
 run() {

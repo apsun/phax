@@ -20,7 +20,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <endian.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/types.h>
@@ -236,18 +235,6 @@ write_all(int fd, const void *buf, size_t nbytes)
 }
 
 /*
- * Repairs the endianness for a search value, copying the value in
- * correct byte order to buf.
- *
- * Currently only LE is supported so this is just a memcpy().
- */
-static void
-fix_endian(uint8_t *buf, uintmax_t val, size_t nbytes)
-{
-    memcpy(buf, &val, nbytes);
-}
-
-/*
  * Searches for the specified pattern within a specific vm mapping.
  * Prints the address of all results found.
  */
@@ -265,13 +252,14 @@ search_vma(int memfd, size_t start, size_t end,
     // buffer to hold those extra bytes plus an entire page's worth
     // of bytes.
     uint8_t buf[BUFFER_SIZE + sizeof(uintmax_t) - 1];
-    size_t buf_off = 0;
-    size_t file_off = 0;
+    size_t buf_count = 0; // Number of bytes in the buffer
+    size_t buf_off = 0; // Buffer window offset into the file
+    size_t file_off = 0; // Number of bytes read from the file
 
     while (start + file_off < end) {
         size_t to_read = end - file_off;
-        if (to_read > sizeof(buf) - buf_off) {
-            to_read = sizeof(buf) - buf_off;
+        if (to_read > sizeof(buf) - buf_count) {
+            to_read = sizeof(buf) - buf_count;
         }
 
         // Clamp to the page size for the initial read
@@ -279,38 +267,42 @@ search_vma(int memfd, size_t start, size_t end,
             to_read = BUFFER_SIZE;
         }
 
-        ssize_t ret = read(memfd, &buf[buf_off], to_read);
+        ssize_t ret = read(memfd, &buf[buf_count], to_read);
         if (ret < 0) {
             perror("read");
             return -1;
         }
 
         file_off += ret;
-        buf_off += ret;
+        buf_count += ret;
 
-        // memmem is a GNU extension that works analogously to
-        // strstr. Logic here is a bit complex: we want to make
-        // sure that we don't miss any results that lie across
-        // read boundaries, so always maintain at least
-        // pattern_size - 1 bytes in the buffer unless we've
-        // reached the end of the region.
-        size_t read_off = 0;
-        while (buf_off - read_off >= pattern_size) {
-            void *result = memmem(&buf[read_off], buf_off - read_off, pattern, pattern_size);
+        // Scan until there are not enough bytes left in the buffer
+        // to find one whole unit.
+        size_t search_off = 0;
+        while (buf_count - search_off >= pattern_size) {
+            void *result = memmem(&buf[search_off], buf_count - search_off,
+                pattern, pattern_size);
+
             if (result == NULL) {
-                ssize_t delta = buf_off - pattern_size + 1;
-                if (delta >= 0 && (size_t)delta > read_off) {
-                    read_off = delta;
+                // If no results found, skip over the remaining bytes,
+                // leaving up to pattern_size - 1 bytes in case the
+                // value straddles a read boundary.
+                ssize_t delta = buf_count - pattern_size + 1;
+                if (delta >= 0 && (size_t)delta > search_off) {
+                    search_off = delta;
                 }
             } else {
+                // If a result found, start the next scan from its
+                // address + 1 so we don't find the same value again.
                 size_t delta = (uint8_t *)result - buf;
-                printf("%p\n", (void *)(start + delta));
-                read_off = delta + 1;
+                printf("%p\n", (void *)(start + buf_off + delta));
+                search_off = delta + 1;
             }
         }
 
-        memmove(&buf[0], &buf[read_off], buf_off - read_off);
-        buf_off -= read_off;
+        memmove(&buf[0], &buf[search_off], buf_count - search_off);
+        buf_count -= search_off;
+        buf_off += search_off;
     }
 
     return 0;
@@ -449,38 +441,44 @@ main(int argc, char **argv)
         return 1;
     }
 
+    // WARNING: ignoring errors up ahead, since handling them
+    // is a massive PITA and I'm lazy. Specific stuff that lacks
+    // error handling:
+    //
+    // - checking that pid is valid
+    // - checking that type is valid
+    // - checking that value is a valid number
+    // - checking that value is in the range of type
+
     pid_t pid = atoi(argv[1]);
     char *type_str = argv[2];
     char *mode_str = argv[3];
     char *value_str = argv[4];
 
-    // WARNING: ignoring errors up ahead, since handling them
-    // is a massive PITA and I'm lazy. Specific stuff that lacks
-    // error handling:
-    //
-    // - checking that type is valid
-    // - checking that value is a valid number
-    // - checking that value is in the range of type
-
-    uintmax_t value;
-    if (type_str[0] == 'i') {
-        value = strtoll(value_str, NULL, 0);
-    } else if (type_str[0] == 'u') {
-        value = strtoull(value_str, NULL, 0);
-    } else {
-        fprintf(stderr, "Invalid type: %s\n", type_str);
-        return 1;
-    }
-
-    size_t nbits = strtoul(&type_str[1], NULL, 0);
-    if (nbits != 8 && nbits != 16 && nbits != 32 && nbits != 64) {
-        fprintf(stderr, "Invalid type: %s\n", type_str);
-        return 1;
-    }
-
-    size_t nbytes = nbits / 8;
+    size_t nbytes;
     uint8_t needle[sizeof(uintmax_t)];
-    fix_endian(needle, value, nbytes);
+
+#define CASE(n, t, f) \
+    if (strcmp(type_str, n) == 0) { \
+        t value = f(value_str, NULL, 0); \
+        nbytes = sizeof(t); \
+        memcpy(needle, &value, nbytes); \
+    }
+
+    CASE("i8", int8_t, strtoll)
+    else CASE("i16", int16_t, strtoll)
+    else CASE("i32", int32_t, strtoll)
+    else CASE("i64", int64_t, strtoll)
+    else CASE("u8", uint8_t, strtoull)
+    else CASE("u16", uint16_t, strtoull)
+    else CASE("u32", uint32_t, strtoull)
+    else CASE("u64", uint64_t, strtoull)
+    else {
+        fprintf(stderr, "Invalid type: %s\n", type_str);
+        return 1;
+    }
+
+#undef CASE
 
     if (ptrace_attach(pid) < 0) {
         return 1;
